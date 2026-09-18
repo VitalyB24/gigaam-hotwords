@@ -11,6 +11,12 @@ updates:
     groups:
       python-dependencies:
         patterns: ["*"]
+    # constraints.txt pins the GigaAM environment to the versions the tool was verified with: the same audio gives the
+    # same transcript, bit for bit. CI runs on synthetic data without torch and cannot vouch for a new version, so
+    # torch and torchaudio are updated by hand, after re-checking the output against a reference transcript.
+    ignore:
+      - dependency-name: "torch"
+      - dependency-name: "torchaudio"
     open-pull-requests-limit: 3
     commit-message:
       prefix: "deps"
