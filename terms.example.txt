@@ -1,0 +1,14 @@
+# An example dictionary for g2h.py: one term per line, spelled the way it should appear in the transcript.
+# Abbreviations in capitals. Only terms that are actually said and that plain decoding gets wrong.
+# Check it: python g2h.py --dict terms.example.txt --dict-check
+
+# abbreviations
+НДС
+ТТН
+ТН ВЭД
+ГОСТ
+
+# names and phrases
+Госстандарт
+электронная подпись
+товарная накладная

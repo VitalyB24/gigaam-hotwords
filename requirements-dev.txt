@@ -1,0 +1,8 @@
+# What the checks need. The script itself runs in the GigaAM environment (README.md, "Requirements"); the tests use
+# a stand-in tokenizer and synthetic data, so torch and GigaAM are not needed here.
+# Bounded on both sides: the lower bound is what the tests are actually run against, the upper one keeps a new major
+# from arriving unread. ruff is still 0.x, and a new minor brings new rules with it — let Dependabot propose the bump
+# so CI answers first.
+numpy>=2.4.5,<3
+pytest>=9.1.1,<10
+ruff>=0.16.5,<0.17

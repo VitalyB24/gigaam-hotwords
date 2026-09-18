@@ -1,0 +1,12 @@
+# The environment, the weights and every piece of data live next to the working copy, never in it.
+venv/
+models/
+GigaAM/
+*.npz
+*.wav
+*.log
+*.partial.txt
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/

@@ -1,0 +1,2 @@
+# One line ending everywhere: always LF in git, whatever the OS prefers in the working copy.
+* text=auto

@@ -1,0 +1,24 @@
+# Metadata and tool configuration. g2h.py is a single script, not an installable package: it runs in the GigaAM
+# virtual environment described in README.md. The development tools are declared in requirements-dev.txt (with the
+# versions the tests are actually run against) and nowhere else, so the two cannot drift apart.
+[project]
+name = "gigaam-hotwords"
+version = "1.0.0"
+description = "Russian speech to text on a CPU with GigaAM v3 CTC and a term dictionary: VAD chunking, CTC prefix beam search with a term bonus"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Vitali Butkevich" }]
+
+[tool.ruff]
+line-length = 130
+target-version = "py312"
+
+[tool.ruff.lint]
+# F/E9 correctness, B bugbear, PERF performance.
+select = ["F", "E9", "B", "PERF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
