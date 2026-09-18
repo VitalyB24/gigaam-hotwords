@@ -78,7 +78,7 @@ venv/Scripts/python g2h.py --audio meeting.wav --out meeting.txt --dict terms.tx
 | `--audio`, `--out` | the WAV (16 kHz, mono, 16-bit) and the transcript to write |
 | `--srt` | where to write the subtitles (default: next to `--out`) |
 | `--title` | the first header line of the transcript |
-| `--dict`, `--w` | the term dictionary and the bonus per term token (default 2); without `--dict` — plain GigaAM |
+| `--dict`, `--w` | the term dictionary and the bonus per term token (default 1); without `--dict` — plain GigaAM |
 | `--threads` | torch CPU threads (default 16) |
 | `--keep-logprobs NPZ` | also save the CTC output of every chunk (about 200 MB for 2.5 hours) |
 | `--from-logprobs NPZ` | re-decode a saved CTC output instead of `--audio`: no model, about 20 s for 2.5 hours |

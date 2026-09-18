@@ -16,7 +16,7 @@ Pipeline:
      search returns the greedy result at any beam width.
 
 Usage (python: the interpreter of the GigaAM virtual environment):
-  python g2h.py --audio rec.wav --out rec.txt [--dict terms.txt] [--w 2] [--title "..."] [--log run.log]
+  python g2h.py --audio rec.wav --out rec.txt [--dict terms.txt] [--w 1] [--title "..."] [--log run.log]
   python g2h.py --audio rec.wav --out rec.txt --dict terms.txt --keep-logprobs rec.npz    keep the CTC output
   python g2h.py --from-logprobs rec.npz --out rec2.txt --dict terms2.txt                 re-decode, no model, seconds
   python g2h.py --dict terms.txt --dict-check                                            terms -> tokens, rejections
@@ -50,7 +50,7 @@ VAD_PARAMETERS = {'min_silence_duration_ms': 500}
 MODEL_NAME = 'v3_e2e_ctc'
 TOKENIZER_FILE = MODEL_NAME + '_tokenizer.model'
 BEAM, PRUNE, NBEST, ENDING = 16, 10.0, 5, 3     # beam width, frame pruning, token splits per form, ending letters
-DEFAULT_W = 2
+DEFAULT_W = 1
 DEFAULT_THREADS = 16
 EXIT_OK, EXIT_NO_AUDIO, EXIT_FAILED = 0, 1, 2
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
