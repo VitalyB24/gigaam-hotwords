@@ -1,5 +1,5 @@
-# Dependabot opens a pull request when a dependency moves past the ranges in requirements-dev.txt, and CI runs on
-# that pull request. Both ecosystems are watched: the Python tools, and the actions, which can silently stay on a
+# Dependabot opens a pull request when a dependency moves past the ranges in requirements-dev.txt or pyproject.toml,
+# and CI runs on that pull request. Both ecosystems are watched: the Python tools, and the actions, which can silently stay on a
 # Node version the runners no longer ship. Monthly and grouped: one pull request to look at, not five; security
 # updates ignore the schedule.
 version: 2
@@ -13,10 +13,12 @@ updates:
         patterns: ["*"]
     # constraints.txt pins the GigaAM environment to the versions the tool was verified with: the same audio gives the
     # same transcript, bit for bit. CI runs on synthetic data without torch and cannot vouch for a new version, so
-    # torch and torchaudio are updated by hand, after re-checking the output against a reference transcript.
+    # torch and torchaudio are updated by hand, after re-checking the output against a reference transcript. The same
+    # goes for sentencepiece: it splits the dictionary terms into tokens, and the tests use a stand-in tokenizer.
     ignore:
       - dependency-name: "torch"
       - dependency-name: "torchaudio"
+      - dependency-name: "sentencepiece"
     open-pull-requests-limit: 3
     commit-message:
       prefix: "deps"

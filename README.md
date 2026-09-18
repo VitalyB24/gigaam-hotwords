@@ -66,6 +66,10 @@ python -m pip install faster-whisper
 On Linux the interpreter of the environment is `venv/bin/python`. The main Python is found as the one the virtual
 environment was created from; another one can be given with `--vad-python`.
 
+`pyproject.toml` lists the same runtime packages (`dependencies`, torch pins as in `constraints.txt`) so that GitHub's
+dependency graph and security alerts see them. It is not an install path: `pip install .` would take torch from PyPI
+instead of PyTorch's CPU index.
+
 ## Usage
 
 ```bash

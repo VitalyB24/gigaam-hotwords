@@ -66,6 +66,10 @@ python -m pip install faster-whisper
 На Linux интерпретатор окружения — `venv/bin/python`. Основной Python находится сам — тот, из которого создано
 виртуальное окружение; другой можно указать через `--vad-python`.
 
+`pyproject.toml` перечисляет те же пакеты (`dependencies`, версии torch — как в `constraints.txt`), чтобы их видели граф
+зависимостей GitHub и алерты безопасности. Ставить окружение через него не нужно: `pip install .` взял бы torch с PyPI,
+а не из CPU-индекса PyTorch.
+
 ## Запуск
 
 ```bash
