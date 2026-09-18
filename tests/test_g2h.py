@@ -239,3 +239,13 @@ def test_words_file_from_saved_logprobs(tmp_path, monkeypatch):
     data = json.loads(words.read_text(encoding='utf-8'))
     assert data['approximate_times'] is False
     assert data['chunks'][0]['words'] == [['ВМ', 5.0, 5.75, 1.0]]
+
+
+def test_defaults_are_the_checked_setting():
+    # w = 3 with reserve 4: checked on full runs of three recorded meetings (no speech lost, more term fixes than w = 1)
+    dec = g2h.Decoder(SP, ['ВМС'])
+    assert (g2h.DEFAULT_W, g2h.DEFAULT_RESERVE) == (3, 4)
+    assert (dec.w, dec.reserve) == (3, 4)
+    assert 'reserve 4' in dec.desc
+    a = g2h.parse_args(['--audio', 'a.wav', '--out', 'a.txt'])
+    assert (a.w, a.reserve) == (3, 4)

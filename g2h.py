@@ -16,10 +16,10 @@ Pipeline:
      search returns the greedy result at any beam width.
 
 Usage (python: the interpreter of the GigaAM virtual environment):
-  python g2h.py --audio rec.wav --out rec.txt [--dict terms.txt] [--w 1] [--title "..."] [--log run.log]
+  python g2h.py --audio rec.wav --out rec.txt [--dict terms.txt] [--w 3] [--reserve 4] [--title "..."] [--log run.log]
   python g2h.py --audio rec.wav --out rec.txt --dict terms.txt --keep-logprobs rec.npz    keep the CTC output
   python g2h.py --from-logprobs rec.npz --out rec2.txt --dict terms2.txt                 re-decode, no model, seconds
-  python g2h.py --audio rec.wav --out rec.txt --dict terms.txt --w 3 --reserve 4          bonus without losing speech
+  python g2h.py --audio rec.wav --out rec.txt --dict terms.txt --w 1 --reserve 0          the defaults before 18.09.2026
   python g2h.py --audio rec.wav --out rec.txt --words rec.words.json                     word times and confidences
   python g2h.py --dict terms.txt --dict-check                                            terms -> tokens, rejections
   python g2h.py --audio rec.wav --out probe.txt --limit-sec 120                          first two minutes only
@@ -52,7 +52,8 @@ VAD_PARAMETERS = {'min_silence_duration_ms': 500}
 MODEL_NAME = 'v3_e2e_ctc'
 TOKENIZER_FILE = MODEL_NAME + '_tokenizer.model'
 BEAM, PRUNE, NBEST, ENDING = 16, 10.0, 5, 3     # beam width, frame pruning, token splits per form, ending letters
-DEFAULT_W = 1
+DEFAULT_W = 3
+DEFAULT_RESERVE = 4
 DEFAULT_THREADS = 16
 EXIT_OK, EXIT_NO_AUDIO, EXIT_FAILED = 0, 1, 2
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
@@ -402,7 +403,7 @@ def greedy_ids(logp):
 
 
 class Decoder:
-    def __init__(self, sp, terms=None, w=DEFAULT_W, dict_name='', reserve=0):
+    def __init__(self, sp, terms=None, w=DEFAULT_W, dict_name='', reserve=DEFAULT_RESERVE):
         self.sp, self.w, self.reserve = sp, w, reserve
         self.lex = Lexicon(sp, terms) if terms else None
         if self.lex:
@@ -712,8 +713,8 @@ def parse_args(argv=None):
     ap.add_argument('--title', help='first header line of the transcript')
     ap.add_argument('--dict', type=Path, help='term dictionary: one term per line (without it: plain greedy GigaAM)')
     ap.add_argument('--w', type=float, default=DEFAULT_W, help='bonus per term token (default %(default)g)')
-    ap.add_argument('--reserve', type=int, default=0, metavar='K',
-                    help='beam slots kept for hypotheses ranked without the bonus of an unfinished term (default 0: off)')
+    ap.add_argument('--reserve', type=int, default=DEFAULT_RESERVE, metavar='K',
+                    help='beam slots kept for hypotheses ranked without the bonus of an unfinished term (default %(default)d; 0 turns it off)')
     ap.add_argument('--words', type=Path, metavar='JSON', help='also write word times and confidences (chunks → words)')
     ap.add_argument('--threads', type=int, default=DEFAULT_THREADS, help='torch CPU threads (default %(default)d)')
     ap.add_argument('--keep-logprobs', type=Path, metavar='NPZ', help='also save the CTC log-probabilities')

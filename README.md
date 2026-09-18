@@ -78,8 +78,8 @@ venv/Scripts/python g2h.py --audio meeting.wav --out meeting.txt --dict terms.tx
 | `--audio`, `--out` | the WAV (16 kHz, mono, 16-bit) and the transcript to write |
 | `--srt` | where to write the subtitles (default: next to `--out`) |
 | `--title` | the first header line of the transcript |
-| `--dict`, `--w` | the term dictionary and the bonus per term token (default 1); without `--dict` — plain GigaAM |
-| `--reserve K` | beam slots kept for hypotheses ranked without the bonus of an unfinished term (default 0: off); see "The dictionary" |
+| `--dict`, `--w` | the term dictionary and the bonus per term token (default 3); without `--dict` — plain GigaAM |
+| `--reserve K` | beam slots kept for hypotheses ranked without the bonus of an unfinished term (default 4; 0 turns it off); see "The dictionary" |
 | `--words JSON` | also write word times and confidences: `{"chunks": [{"start", "end", "conf", "words": [[word, start, end, conf], …]}]}` |
 | `--threads` | torch CPU threads (default 16) |
 | `--keep-logprobs NPZ` | also save the CTC output of every chunk (about 200 MB for 2.5 hours) |
@@ -119,8 +119,10 @@ unfinished term, so the plain continuation of the speech stays in the beam, and 
 it at the end of the chunk. On three recorded meetings (1 h 50 min to 2 h 47 min each, a 36-term dictionary), checked
 against an independent Whisper transcript: `w = 2` without a reserve lost 9 phrases (112 words); with `--reserve 4`
 no phrase was lost at `w = 2` or `w = 3`, and `w = 3 --reserve 4` fixed 39 term spellings against 28 at `w = 1`
-without a reserve, with 1 confirmed worsening against 2. The default stays 0, so the output of existing settings does
-not change.
+without a reserve, with 1 confirmed worsening against 2. Full runs of the same three recordings (sound → chunks →
+encoder → decoder) matched the re-decoding word for word, so `w = 3 --reserve 4` is the default; `--w 1 --reserve 0`
+reproduces the earlier default. The setting was checked with one 36-term dictionary: check yours (below) before
+relying on it.
 
 `--dict-check` shows whether every form of every term has a usable token split; a form without one never gets the
 bonus.
