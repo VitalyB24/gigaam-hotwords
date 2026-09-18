@@ -19,6 +19,8 @@ Usage (python: the interpreter of the GigaAM virtual environment):
   python g2h.py --audio rec.wav --out rec.txt [--dict terms.txt] [--w 1] [--title "..."] [--log run.log]
   python g2h.py --audio rec.wav --out rec.txt --dict terms.txt --keep-logprobs rec.npz    keep the CTC output
   python g2h.py --from-logprobs rec.npz --out rec2.txt --dict terms2.txt                 re-decode, no model, seconds
+  python g2h.py --audio rec.wav --out rec.txt --dict terms.txt --w 3 --reserve 4          bonus without losing speech
+  python g2h.py --audio rec.wav --out rec.txt --words rec.words.json                     word times and confidences
   python g2h.py --dict terms.txt --dict-check                                            terms -> tokens, rejections
   python g2h.py --audio rec.wav --out probe.txt --limit-sec 120                          first two minutes only
 
@@ -322,10 +324,15 @@ def final_bonus(st):
     return fin
 
 
-def beam_decode(lex, logp, w, beam=BEAM, prune=PRUNE):
+def beam_decode(lex, logp, w, beam=BEAM, prune=PRUNE, reserve=0):
     """CTC prefix beam search with the term bonus. The score of a hypothesis (a prefix) is its best alignment — the
     maximum over alignments, not the sum; with beam 1 and w = 0 this is exactly greedy decoding. logp: [T, C] log-
-    probabilities, the blank is the last class."""
+    probabilities, the blank is the last class.
+
+    reserve: beam slots kept for the best hypotheses ranked without the bonus of an unfinished term. Without them a
+    hypothesis that has spelled the beginning of a term keeps that bonus while it waits on blanks, and hypotheses like it
+    can push the plain continuation of the speech out of the beam; when the term never completes, the words after it are
+    lost. 0 — the search as before (every slot ranked with the bonus)."""
     import numpy as np
     T, C = logp.shape
     blank = C - 1
@@ -368,6 +375,16 @@ def beam_decode(lex, logp, w, beam=BEAM, prune=PRUNE):
                 elif val > e[1]:
                     e[1] = val
         ranked = sorted(nxt.items(), key=lambda kv: -(max(kv[1]) + w * live_bonus(state[kv[0]])))
+        if reserve and w:
+            keep = sorted(nxt.items(), key=lambda kv: -max(kv[1]))[:min(reserve, beam)]
+            seen = {pid for pid, _ in keep}
+            for kv in ranked:
+                if len(keep) >= beam:
+                    break
+                if kv[0] not in seen:
+                    keep.append(kv)
+                    seen.add(kv[0])
+            ranked = keep
         beams = [(pid, v[0], v[1]) for pid, v in ranked[:beam]]
     best = max(beams, key=lambda b: max(b[1], b[2]) + w * final_bonus(state[b[0]]))[0]
     ids = []
@@ -385,18 +402,113 @@ def greedy_ids(logp):
 
 
 class Decoder:
-    def __init__(self, sp, terms=None, w=DEFAULT_W, dict_name=''):
-        self.sp, self.w = sp, w
+    def __init__(self, sp, terms=None, w=DEFAULT_W, dict_name='', reserve=0):
+        self.sp, self.w, self.reserve = sp, w, reserve
         self.lex = Lexicon(sp, terms) if terms else None
         if self.lex:
-            self.desc = ('CTC prefix beam search (best alignment), beam %d, prune -%g; dictionary %s: %d terms, %d token '
-                         'sequences; w = %g' % (BEAM, PRUNE, dict_name, len(terms), self.lex.sequences(), w))
+            self.desc = ('CTC prefix beam search (best alignment), beam %d, prune -%g%s; dictionary %s: %d terms, %d token '
+                         'sequences; w = %g' % (BEAM, PRUNE, ', reserve %d' % reserve if reserve else '', dict_name,
+                                                len(terms), self.lex.sequences(), w))
         else:
             self.desc = 'greedy CTC, no dictionary'
 
+    def ids(self, logp):
+        return beam_decode(self.lex, logp, self.w, reserve=self.reserve) if self.lex else greedy_ids(logp)
+
     def text(self, logp):
-        ids = beam_decode(self.lex, logp, self.w) if self.lex else greedy_ids(logp)
-        return self.sp.decode_ids(ids).strip()
+        return self.sp.decode_ids(self.ids(logp)).strip()
+
+
+# ---------------------------------------------------------------- word times and confidence
+
+def ctc_align(logp, ids):
+    """Forced CTC alignment (the best path) of a decoded token sequence to its chunk's log-probabilities: for every
+    token its first and last frame and its best log-probability on them. None if the sequence does not fit the frames."""
+    import numpy as np
+    T, C = logp.shape
+    if not ids:
+        return []
+    blank = C - 1
+    ext = np.array([blank] + [x for c in ids for x in (c, blank)])
+    S = len(ext)
+    if T < len(ids):
+        return None
+    skip = np.zeros(S, dtype=bool)                   # s may be reached from s - 2: a token differing from the one before
+    skip[3::2] = ext[3::2] != ext[1:-2:2]
+    low = -1e30
+    alpha = np.full(S, low)
+    alpha[0], alpha[1] = logp[0, ext[0]], logp[0, ext[1]]
+    back = np.zeros((T, S), dtype=np.int8)
+    emit = logp[:, ext]
+    for t in range(1, T):
+        prev1 = np.concatenate(([low], alpha[:-1]))
+        prev2 = np.where(skip, np.concatenate(([low, low], alpha[:-2])), low)
+        best = np.maximum(np.maximum(alpha, prev1), prev2)
+        back[t] = np.where(best == alpha, 0, np.where(best == prev1, 1, 2))
+        alpha = best + emit[t]
+    s = S - 1 if alpha[S - 1] >= alpha[S - 2] else S - 2
+    if alpha[s] <= low / 2:
+        return None
+    path = np.empty(T, dtype=np.int64)
+    for t in range(T - 1, 0, -1):
+        path[t] = s
+        s -= int(back[t, s])
+    path[0] = s
+    if s > 1:
+        return None
+    out = []
+    for k, c in enumerate(ids):
+        fr = np.nonzero(path == 2 * k + 1)[0]
+        if not len(fr):
+            return None
+        out.append((int(fr[0]), int(fr[-1]), float(logp[fr, c].max())))
+    return out
+
+
+def frame_clock(T, samples=None, parts=None, start=0.0, end=0.0):
+    """Frame index of a chunk -> time in the recording. A chunk is its speech parts glued together, so the time goes
+    through the parts; without them — linearly between the chunk's start and end."""
+    if parts:
+        total = samples or sum(e - s for s, e in parts)
+        spans, acc = [], 0
+        for s, e in parts:
+            spans.append((acc, s, e))
+            acc += e - s
+
+        def clock(f):
+            x = min(max(f * total / T, 0.0), float(acc))
+            for a0, s, e in spans:
+                if x <= a0 + (e - s):
+                    return (s + x - a0) / SR
+            return parts[-1][1] / SR
+        return clock
+    return lambda f: start + (end - start) * min(max(f / T, 0.0), 1.0)
+
+
+def chunk_words(sp, logp, ids, clock):
+    """(confidence of the chunk, [[word, start, end, confidence], …]); the confidence is the geometric mean of the
+    tokens' best probabilities on their aligned frames. (None, []) for an empty chunk or one that does not align."""
+    import numpy as np
+    al = ctc_align(logp, ids)
+    if not al:
+        return None, []
+    words = []
+    for c, (f0, f1, lp) in zip(ids, al, strict=True):
+        if not words or sp.id_to_piece(c).startswith('▁'):
+            words.append([[c], f0, f1, [lp]])
+        else:
+            words[-1][0].append(c)
+            words[-1][2] = f1
+            words[-1][3].append(lp)
+    out = [[sp.decode_ids(w_ids).strip(), round(clock(f0), 2), round(clock(f1 + 1), 2), round(float(np.exp(np.mean(lps))), 3)]
+           for w_ids, f0, f1, lps in words]
+    return round(float(np.exp(np.mean([lp for _, _, lp in al]))), 3), [w for w in out if w[0]]
+
+
+def write_words(path, head, chunks):
+    Path(path).write_text(json.dumps(dict(head, chunks=chunks), ensure_ascii=False, separators=(',', ':')),
+                          encoding='utf-8')
+    log('    word times: %s (%d chunks, %d words)' % (path, len(chunks), sum(len(c['words']) for c in chunks)))
 
 
 def load_tokenizer(models):
@@ -450,6 +562,8 @@ def load_logprobs(path):
         chunks = json.loads(side.read_text(encoding='utf-8'))['chunks']
         starts, ends = [c['start'] for c in chunks], [c['end'] for c in chunks]
         meta = {'chunks_from': side.name}
+        if all('parts' in c and 'samples' in c for c in chunks):
+            meta.update(samples=[c['samples'] for c in chunks], parts=[c['parts'] for c in chunks])
     if len(starts) != len(lps):
         raise RuntimeError('%s: %d chunks, but %d chunk times' % (path, len(lps), len(starts)))
     return lps, starts, ends, meta
@@ -483,10 +597,10 @@ def run_audio(a, terms):
     model = gigaam.load_model(MODEL_NAME, fp16_encoder=False, use_flash=False, device='cpu', download_root=str(a.models))
     load_sec = time.time() - t_load
     sp = load_tokenizer(a.models)
-    dec = Decoder(sp, terms, a.w, a.dict.name if a.dict else '')
+    dec = Decoder(sp, terms, a.w, a.dict.name if a.dict else '', a.reserve)
     log('    GigaAM %s loaded in %.0f s (%.0fM parameters), torch threads %d; decoder: %s' % (
         MODEL_NAME, load_sec, sum(p.numel() for p in model.parameters()) / 1e6, torch.get_num_threads(), dec.desc))
-    segs, lps, empty, mism = [], [], 0, []
+    segs, lps, empty, mism, wchunks = [], [], 0, [], []
     t0 = last = time.time()
     part = partial_path(a.out)
     with open(part, 'w', encoding='utf-8', newline='\n') as pf:
@@ -503,7 +617,11 @@ def run_audio(a, terms):
                 own = model._decode(encoded, encoded_len, length)[0][0].strip()
             if sp.decode_ids(greedy_ids(lp)).strip() != own:     # greedy over the log-probabilities = GigaAM's decoding
                 mism.append(i)
-            text = dec.text(lp)
+            ids = dec.ids(lp)
+            text = sp.decode_ids(ids).strip()
+            if a.words:
+                conf, words = chunk_words(sp, lp, ids, frame_clock(len(lp), ch['samples'], ch['parts']))
+                wchunks.append({'start': ch['start'], 'end': ch['end'], 'conf': conf, 'words': words})
             if a.keep_logprobs:
                 lps.append(lp)
             empty += not text
@@ -523,10 +641,13 @@ def run_audio(a, terms):
                 VAD_PARAMETERS['min_silence_duration_ms'], CHUNK_SEC, ', first %g s only' % a.limit_sec if a.limit_sec else '',
                 dec.desc, len(segs), empty, fmt(total), data['vad_sec'], load_sec, fmt(recog), peak))
     write_outputs(a.out, a.srt, a.title or 'Transcript of %s' % a.audio.name, info, segs)
+    if a.words:
+        write_words(a.words, {'audio': a.audio.name, 'model': MODEL_NAME, 'decoder': dec.desc}, wchunks)
     if a.keep_logprobs:
         save_logprobs(a.keep_logprobs, lps, segs, {'model': MODEL_NAME, 'audio': a.audio.name, 'audio_sha1': data['audio_sha1'],
                                                    'faster_whisper': data['faster_whisper'], 'vad_parameters': data['vad_parameters'],
-                                                   'limit_sec': a.limit_sec, 'threads': a.threads, 'greedy_mismatch': mism})
+                                                   'limit_sec': a.limit_sec, 'threads': a.threads, 'greedy_mismatch': mism,
+                                                   'samples': [c['samples'] for c in chunks], 'parts': [c['parts'] for c in chunks]})
     part.unlink(missing_ok=True)
     return len(segs), empty, total
 
@@ -536,14 +657,22 @@ def run_logprobs(a, terms):
     t_start = time.time()
     lps, starts, ends, meta = load_logprobs(a.from_logprobs)
     sp = load_tokenizer(a.models)
-    dec = Decoder(sp, terms, a.w, a.dict.name if a.dict else '')
+    dec = Decoder(sp, terms, a.w, a.dict.name if a.dict else '', a.reserve)
     log('    %d chunks from %s; decoder: %s' % (len(lps), a.from_logprobs, dec.desc))
-    segs = []
+    segs, wchunks = [], []
+    parts, samples = meta.get('parts'), meta.get('samples')
+    if a.words and not parts:
+        log('    ! no chunk parts saved with the log-probabilities: word times are spread linearly over each chunk')
     part = partial_path(a.out)
     with open(part, 'w', encoding='utf-8', newline='\n') as pf:
         pf.write('# PARTIAL transcript, written while g2h runs: %s\n\n' % Path(a.from_logprobs).name)
-        for s, e, lp in zip(starts, ends, lps, strict=True):
-            segs.append((s, e, dec.text(lp)))
+        for i, (s, e, lp) in enumerate(zip(starts, ends, lps, strict=True)):
+            ids = dec.ids(lp)
+            segs.append((s, e, sp.decode_ids(ids).strip()))
+            if a.words:
+                clock = frame_clock(len(lp), samples[i], parts[i]) if parts else frame_clock(len(lp), start=s, end=e)
+                conf, words = chunk_words(sp, lp, ids, clock)
+                wchunks.append({'start': s, 'end': e, 'conf': conf, 'words': words})
             pf.write('[%s → %s] %s\n' % (fmt(s), fmt(e), segs[-1][2]))
             pf.flush()
     empty, total = sum(1 for _, _, t in segs if not t), time.time() - t_start
@@ -551,6 +680,9 @@ def run_logprobs(a, terms):
         datetime.now().isoformat(timespec='seconds'), Path(a.from_logprobs).name, meta.get('model', MODEL_NAME), dec.desc,
         len(segs), empty, fmt(total))
     write_outputs(a.out, a.srt, a.title or 'Transcript re-decoded from %s' % Path(a.from_logprobs).name, info, segs)
+    if a.words:
+        write_words(a.words, {'audio': meta.get('audio', Path(a.from_logprobs).name), 'model': meta.get('model', MODEL_NAME),
+                              'decoder': dec.desc, 'approximate_times': not parts}, wchunks)
     part.unlink(missing_ok=True)
     return len(segs), empty, total
 
@@ -580,6 +712,9 @@ def parse_args(argv=None):
     ap.add_argument('--title', help='first header line of the transcript')
     ap.add_argument('--dict', type=Path, help='term dictionary: one term per line (without it: plain greedy GigaAM)')
     ap.add_argument('--w', type=float, default=DEFAULT_W, help='bonus per term token (default %(default)g)')
+    ap.add_argument('--reserve', type=int, default=0, metavar='K',
+                    help='beam slots kept for hypotheses ranked without the bonus of an unfinished term (default 0: off)')
+    ap.add_argument('--words', type=Path, metavar='JSON', help='also write word times and confidences (chunks → words)')
     ap.add_argument('--threads', type=int, default=DEFAULT_THREADS, help='torch CPU threads (default %(default)d)')
     ap.add_argument('--keep-logprobs', type=Path, metavar='NPZ', help='also save the CTC log-probabilities')
     ap.add_argument('--from-logprobs', type=Path, metavar='NPZ', help='re-decode saved log-probabilities instead of --audio')

@@ -79,6 +79,8 @@ venv/Scripts/python g2h.py --audio meeting.wav --out meeting.txt --dict terms.tx
 | `--srt` | where to write the subtitles (default: next to `--out`) |
 | `--title` | the first header line of the transcript |
 | `--dict`, `--w` | the term dictionary and the bonus per term token (default 1); without `--dict` — plain GigaAM |
+| `--reserve K` | beam slots kept for hypotheses ranked without the bonus of an unfinished term (default 0: off); see "The dictionary" |
+| `--words JSON` | also write word times and confidences: `{"chunks": [{"start", "end", "conf", "words": [[word, start, end, conf], …]}]}` |
 | `--threads` | torch CPU threads (default 16) |
 | `--keep-logprobs NPZ` | also save the CTC output of every chunk (about 200 MB for 2.5 hours) |
 | `--from-logprobs NPZ` | re-decode a saved CTC output instead of `--audio`: no model, about 20 s for 2.5 hours |
@@ -112,8 +114,25 @@ the words after it are lost. Check a dictionary before relying on it:
 3. compare: the dictionary version should keep at least 99 % of the words of the plain one, and no term should appear
    where nothing was said (a run of dictionary terms in a row is the typical sign).
 
+`--reserve K` removes that loss: K beam slots are kept for the best hypotheses ranked without the bonus of an
+unfinished term, so the plain continuation of the speech stays in the beam, and a term that never completes loses to
+it at the end of the chunk. On three recorded meetings (1 h 50 min to 2 h 47 min each, a 36-term dictionary), checked
+against an independent Whisper transcript: `w = 2` without a reserve lost 9 phrases (112 words); with `--reserve 4`
+no phrase was lost at `w = 2` or `w = 3`, and `w = 3 --reserve 4` fixed 39 term spellings against 28 at `w = 1`
+without a reserve, with 1 confirmed worsening against 2. The default stays 0, so the output of existing settings does
+not change.
+
 `--dict-check` shows whether every form of every term has a usable token split; a form without one never gets the
 bonus.
+
+## Word times and confidence
+
+`--words rec.words.json` aligns the decoded tokens back to the CTC frames (the best path) and writes, for every chunk,
+its words with start and end times in the recording and a confidence — the geometric mean of the tokens' best
+probabilities on their frames — plus the chunk's own confidence. A chunk is its speech parts glued together, so the
+times go through those parts; files saved with `--keep-logprobs` carry them, and re-decoding keeps exact times. Low
+chunk confidence marks the places worth a second look: on one meeting, 6 of 10 places where an independent transcript
+heard speech the dictionary run did not were in the 6 % least confident chunks.
 
 ## Development
 

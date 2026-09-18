@@ -175,3 +175,67 @@ def test_logprobs_without_times_take_them_from_the_chunk_file(tmp_path):
                                               encoding='utf-8')
     _, starts, ends, _ = g2h.load_logprobs(tmp_path / 'old.npz')
     assert (starts, ends) == ([1.0, 3.0], [2.0, 4.5])
+
+
+def test_reserve_keeps_the_plain_continuation():
+    # two terms start after "▁В"; with beam 2 their unfinished prefixes, both holding the bonus, crowd out the plain "Ве"
+    lex = g2h.Lexicon(SP, ['ВМС', 'ВНЗ'])
+    v, m, n, e, a, b = ids_of('▁В', 'М', 'Н', 'е', 'а', 'б')
+    lp = frames([{v: 1.0}, {m: 0.3, n: 0.3, e: 0.4}, {a: 1.0}, {b: 1.0}])
+    assert SP.decode_ids(g2h.beam_decode(lex, lp, 0, beam=2)) == 'Веаб'
+    assert SP.decode_ids(g2h.beam_decode(lex, lp, 5, beam=2)) in ('ВМаб', 'ВНаб')
+    assert SP.decode_ids(g2h.beam_decode(lex, lp, 5, beam=2, reserve=1)) == 'Веаб'
+
+
+def test_reserve_keeps_a_term_that_completes():
+    lex = g2h.Lexicon(SP, ['ВМС'])
+    term, alt = ids_of('▁В', 'М', 'С'), SP.piece_to_id('е')
+    p_lo, p_hi = 1 / (1 + math.e), math.e / (1 + math.e)
+    lp = frames([{term[0]: 1.0}, {term[1]: 1.0}, {term[2]: p_lo, alt: p_hi}])
+    assert SP.decode_ids(g2h.beam_decode(lex, lp, 2, reserve=4)) == 'ВМС'
+
+
+@pytest.mark.parametrize('seed', range(4))
+def test_reserve_with_zero_bonus_is_greedy(seed):
+    lex = g2h.Lexicon(SP, ['ВМС', 'надбавка импортёра'])
+    lp = random_logprobs(seed)
+    assert g2h.beam_decode(lex, lp, 0, reserve=8) == g2h.greedy_ids(lp)
+
+
+def test_ctc_align_finds_the_frames_of_every_token():
+    v, m = ids_of('▁В', 'М')
+    lp = frames([{v: 1.0}, {m: 1.0}])                            # frames: В, blank, М, blank
+    al = g2h.ctc_align(lp, [v, m])
+    assert [(f0, f1) for f0, f1, _ in al] == [(0, 0), (2, 2)]
+    assert all(p > -1e-6 for _, _, p in al)
+    assert g2h.ctc_align(lp, []) == []
+    assert g2h.ctc_align(lp[:1], [v, m]) is None                 # two tokens do not fit one frame
+
+
+def test_chunk_words_times_and_confidence():
+    v, m, a = ids_of('▁В', 'М', '▁а')
+    lp = frames([{v: 1.0}, {m: 1.0}, {a: 1.0}])                  # 6 frames
+    conf, words = g2h.chunk_words(SP, lp, [v, m, a], g2h.frame_clock(len(lp), start=10.0, end=16.0))
+    assert [w for w, _, _, _ in words] == ['ВМ', 'а']
+    assert [(s, e) for _, s, e, _ in words] == [(10.0, 13.0), (14.0, 15.0)]
+    assert conf == 1.0 and all(p == 1.0 for *_, p in words)
+
+
+def test_frame_clock_goes_through_the_speech_parts():
+    clock = g2h.frame_clock(100, 32000, [[0, 16000], [32000, 48000]])     # two 1 s parts with 1 s of silence between
+    assert clock(0) == 0.0
+    assert clock(25) == 0.5
+    assert clock(75) == 2.5
+    assert clock(100) == 3.0
+
+
+def test_words_file_from_saved_logprobs(tmp_path, monkeypatch):
+    monkeypatch.setattr(g2h, 'load_tokenizer', lambda models: SP)
+    v, m = ids_of('▁В', 'М')
+    lps = [frames([{v: 1.0}, {m: 1.0}]).astype(np.float32)]
+    g2h.save_logprobs(tmp_path / 'rec.npz', lps, [(5.0, 6.0, 'ВМ')], {'model': 'm', 'samples': [16000], 'parts': [[[80000, 96000]]]})
+    out, words = tmp_path / 'rec.txt', tmp_path / 'rec.words.json'
+    assert g2h.main(['--from-logprobs', str(tmp_path / 'rec.npz'), '--out', str(out), '--words', str(words)]) == 0
+    data = json.loads(words.read_text(encoding='utf-8'))
+    assert data['approximate_times'] is False
+    assert data['chunks'][0]['words'] == [['ВМ', 5.0, 5.75, 1.0]]
