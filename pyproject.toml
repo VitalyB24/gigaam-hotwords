@@ -1,8 +1,10 @@
 # Metadata and tool configuration. g2h.py is a single script, not an installable package: it runs in the GigaAM
 # virtual environment described in README.md, installed as shown there. The dependencies below list that environment's
 # runtime packages for GitHub's dependency graph, so security alerts cover torch and torchaudio too; the torch pins
-# repeat constraints.txt, and a test keeps the two in step. The development tools are declared in requirements-dev.txt
-# (with the versions the tests are actually run against) and nowhere else, so the two cannot drift apart.
+# repeat constraints.txt, and a test keeps the two in step. faster-whisper is not listed: the chunking step runs in the
+# main Python, outside this environment (README.md, "Requirements"). The development tools are declared in
+# requirements-dev.txt (with the versions the tests are actually run against) and nowhere else, so the two cannot drift
+# apart; numpy is named in both files, and a test keeps its two ranges equal.
 [project]
 name = "gigaam-hotwords"
 version = "1.0.0"

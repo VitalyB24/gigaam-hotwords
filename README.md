@@ -26,8 +26,9 @@ bonus to the paths that spell a known term, and the acoustic evidence still deci
 ## How it works
 
 1. **Chunking.** The voice activity detector of faster-whisper (Silero VAD, pause 500 ms) cuts the recording into
-   speech chunks of at most 25 s, merged exactly as faster-whisper's batched pipeline merges them. The same chunking
-   as a Whisper transcription of the same file means two transcripts can be compared chunk by chunk. The detector runs
+   speech chunks of at most 25 s, merged exactly as faster-whisper's batched pipeline merges them. A batched
+   faster-whisper transcription of the same file gets the same chunks when it runs with the same VAD settings and
+   `chunk_length=25` (its own default is 30 s); then two transcripts can be compared chunk by chunk. The detector runs
    in the main Python (the one with faster-whisper); `g2h.py` calls it as a subprocess, so the GigaAM environment stays
    small.
 2. **Acoustics.** Every chunk goes through the GigaAM `v3_e2e_ctc` encoder on the CPU (16 threads by default).
@@ -36,7 +37,8 @@ bonus to the paths that spell a known term, and the acoustic evidence still deci
    - With a dictionary: a CTC prefix beam search. The score of a hypothesis is its best alignment (the maximum over
      alignments rather than their sum), the beam is 16 wide, and on every frame the blank and the tokens within 10 of
      the frame's best log-probability are tried. Every term is split into SentencePiece tokens (up to five splits per
-     form; a term not written in capitals also gets lower-case and capitalised first-letter forms). A hypothesis gets
+     form; a term also gets lower-case and capitalised first-letter forms, unless it is written in capitals or its
+     first word is an abbreviation, as in "ТТН на возврат"). A hypothesis gets
      `w` for every token of a term it spells from the start of a word; leaving a term before its end takes the bonus
      back, completing it keeps it, and an ending of up to three letters may follow ("НДС" → "НДСы").
    - With `w = 0` the beam search returns the greedy result at any beam width; the tests check this.
@@ -83,30 +85,35 @@ venv/Scripts/python g2h.py --audio meeting.wav --out meeting.txt --dict terms.tx
 | `--srt` | where to write the subtitles (default: next to `--out`) |
 | `--title` | the first header line of the transcript |
 | `--dict`, `--w` | the term dictionary and the bonus per term token (default 3); without `--dict` — plain GigaAM |
-| `--reserve K` | beam slots kept for hypotheses ranked without the bonus of an unfinished term (default 4; 0 turns it off); see "The dictionary" |
+| `--reserve K` | beam slots kept for the hypotheses that are best by the acoustic score alone, without any term bonus (default 4; 0 turns it off); see "The dictionary" |
 | `--words JSON` | also write word times and confidences: `{"chunks": [{"start", "end", "conf", "words": [[word, start, end, conf], …]}]}` |
 | `--threads` | torch CPU threads (default 16) |
 | `--keep-logprobs NPZ` | also save the CTC output of every chunk (about 200 MB for 2.5 hours) |
 | `--from-logprobs NPZ` | re-decode a saved CTC output instead of `--audio`: no model, about 20 s for 2.5 hours |
-| `--dict-check` | show how every term maps to tokens, with the rejected splits, and exit |
+| `--dict-check` | show how every term maps to tokens, with the rejected splits, and exit (code 2 when a form has no usable split) |
 | `--limit-sec N` | the first N seconds only — a quick probe of the setup |
 | `--log FILE` | append the log to a file as well |
 | `--models`, `--vad-python` | the weights folder and the Python with faster-whisper, if not the defaults |
 
 **Output.** Two header lines starting with `#`, then one line per chunk: `[H:MM:SS → H:MM:SS] text`. Subtitles go to
-an `.srt` next to it. While the script runs, every chunk is appended to `<out>.partial.txt`, so a killed run leaves
-the text it had; the partial file is removed at the end. The log has `=== START g2h`, `=== DONE g2h` and
-`=== FAILED g2h` markers; the exit code is 0 on success, 1 when there is nothing to transcribe (no file, an empty
-one, no speech), 2 on a failure. On Windows the script keeps the machine awake while it runs.
+an `.srt` next to it. While the script runs, every chunk is appended to a `.partial.txt` file named after `--out`
+without its extension (`rec.txt` → `rec.partial.txt`), so a killed run leaves the text it had; the partial file is
+removed at the end. The
+log has `=== START g2h`, `=== DONE g2h` and `=== FAILED g2h` markers; a line with `!` is a warning (a dictionary form
+that never gets the bonus, a log or partial file that cannot be written or removed), and the run goes on. The exit
+code is 0 on success, 1 when there is nothing to transcribe (no file, an empty one, no speech), 2 on a failure; a
+wrong argument or a missing output folder is refused before any work is done. On Windows the script keeps the machine
+awake while it runs.
 
 **Speed.** A 2 h 23 min recording on 16 threads: chunking 10 s, encoder 2 min, beam decoding with a 36-term
 dictionary 20 s.
 
 ## The dictionary
 
-One term per line, written the way it should appear in the transcript; abbreviations in capitals; `#` starts a
-comment (see `terms.example.txt`). Put in only the terms that are actually said and that plain decoding gets wrong:
-every term is a path the decoder is invited to take.
+A UTF-8 text file, one term per line, written the way it should appear in the transcript; abbreviations in capitals;
+`#` starts a comment (see `terms.example.txt`). What an editor hides — a byte order mark, zero-width characters,
+no-break and doubled spaces — is cleaned on reading, and a repeated term counts once. Put in only the terms that are
+actually said and that plain decoding gets wrong: every term is a path the decoder is invited to take.
 
 `w` trades terms against speech. A small bonus fixes a term the model was unsure about; a large one lets a hypothesis
 that has spelled the beginning of a term push the real continuation out of the beam — if the term never completes,
@@ -118,27 +125,35 @@ the words after it are lost. Check a dictionary before relying on it:
 3. compare: the dictionary version should keep at least 99 % of the words of the plain one, and no term should appear
    where nothing was said (a run of dictionary terms in a row is the typical sign).
 
-`--reserve K` removes that loss: K beam slots are kept for the best hypotheses ranked without the bonus of an
-unfinished term, so the plain continuation of the speech stays in the beam, and a term that never completes loses to
-it at the end of the chunk. On three recorded meetings (1 h 50 min to 2 h 47 min each, a 36-term dictionary), checked
+`--reserve K` removes that loss: K beam slots are kept for the hypotheses that are best by the acoustic score alone,
+without any term bonus, so the plain continuation of the speech stays in the beam, and a term that never completes
+loses to it at the end of the chunk. The reserve has a limit: once the dictionary has corrected a term in a chunk, the
+reserved slots guard the paths without that correction, and the plain continuation of the corrected path can still be
+pushed out of the beam. On three recorded meetings (1 h 50 min to 2 h 47 min each, a 36-term dictionary), checked
 against an independent Whisper transcript: `w = 2` without a reserve lost 9 phrases (112 words); with `--reserve 4`
 no phrase was lost at `w = 2` or `w = 3`, and `w = 3 --reserve 4` fixed 39 term spellings against 28 at `w = 1`
 without a reserve, with 1 confirmed worsening against 2. Full runs of the same three recordings (sound → chunks →
 encoder → decoder) matched the re-decoding word for word, so `w = 3 --reserve 4` is the default; `--w 1 --reserve 0`
-reproduces the earlier default. The setting was checked with one 36-term dictionary: check yours (below) before
-relying on it.
+reproduces the earlier default. The setting was checked with one 36-term dictionary: check yours (the three steps
+above and `--dict-check`) before relying on it.
 
 `--dict-check` shows whether every form of every term has a usable token split; a form without one never gets the
-bonus.
+bonus. Its exit code is 2 when there is such a form and 0 otherwise; an ordinary run names these forms in its log and
+goes on.
+
+A term gets no bonus when it begins right after the first words of a longer dictionary term that is still matching:
+with "ставка НДС" in the dictionary, "НДФЛ" in "ставка НДФЛ" is decoded as without a dictionary.
 
 ## Word times and confidence
 
 `--words rec.words.json` aligns the decoded tokens back to the CTC frames (the best path) and writes, for every chunk,
 its words with start and end times in the recording and a confidence — the geometric mean of the tokens' best
 probabilities on their frames — plus the chunk's own confidence. A chunk is its speech parts glued together, so the
-times go through those parts; files saved with `--keep-logprobs` carry them, and re-decoding keeps exact times. Low
-chunk confidence marks the places worth a second look: on one meeting, 6 of 10 places where an independent transcript
-heard speech the dictionary run did not were in the 6 % least confident chunks.
+times go through those parts; files saved with `--keep-logprobs` carry them, and re-decoding keeps exact times. Next
+to `chunks` the file names the `audio`, the `model` and the `decoder`; a re-decoding adds `approximate_times` — `true`
+when the saved file carries no speech parts and the times are spread linearly over each chunk. A chunk without text
+has `"conf": null`. Low chunk confidence marks the places worth a second look: on one meeting, 6 of 10 places where an
+independent transcript heard speech the dictionary run did not were in the 6 % least confident chunks.
 
 ## Development
 

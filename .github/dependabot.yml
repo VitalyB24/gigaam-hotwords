@@ -1,5 +1,6 @@
-# Dependabot opens a pull request when a dependency moves past the ranges in requirements-dev.txt or pyproject.toml,
-# and CI runs on that pull request. Both ecosystems are watched: the Python tools, and the actions, which can silently stay on a
+# Dependabot proposes the new versions once a month, and CI runs on its pull request. For an application it raises the
+# lower bounds of the ranges in requirements-dev.txt and pyproject.toml with every new release, not only when a release
+# moves past a range. Both ecosystems are watched: the Python tools, and the actions, which can silently stay on a
 # Node version the runners no longer ship. Monthly and grouped: one pull request to look at, not five; security
 # updates ignore the schedule.
 version: 2

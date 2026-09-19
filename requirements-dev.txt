@@ -5,4 +5,4 @@
 # so CI answers first.
 numpy>=2.5.3,<3
 pytest>=9.1.1,<10
-ruff>=0.16.7,<0.17
+ruff>=0.16.8,<0.17

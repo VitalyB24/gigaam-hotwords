@@ -6,7 +6,8 @@ Pipeline:
   1. Voice activity detection of faster-whisper (Silero VAD, pause 500 ms) cuts the recording into speech chunks
      of at most 25 s, merged exactly as faster-whisper's BatchedInferencePipeline merges them; a chunk is its speech
      parts glued together, its timestamps map back to the recording. The detector runs in the main Python that has
-     faster-whisper installed (a subprocess), so the chunking is the one a Whisper transcription of the same file uses.
+     faster-whisper installed (a subprocess). A batched faster-whisper transcription of the same file gets the same
+     chunks when it runs with the same VAD settings and chunk_length=25 (its own default is 30 s).
   2. Every chunk goes through the GigaAM v3_e2e_ctc encoder on the CPU.
   3. Decoding. Without a dictionary: greedy CTC, exactly GigaAM's own. With one: a CTC prefix beam search whose
      hypothesis score is its best alignment (the maximum over alignments, not the sum), beam 16; on every frame the
@@ -26,14 +27,16 @@ Usage (python: the interpreter of the GigaAM virtual environment):
 
 Input: WAV, 16 kHz, mono, 16-bit (ffmpeg -i in -ac 1 -ar 16000 -vn -acodec pcm_s16le out.wav).
 Output: a two-line "#" header, then one line per chunk "[H:MM:SS → H:MM:SS] text"; an .srt next to it (--srt to
-place it elsewhere); <out>.partial.txt is written chunk by chunk while running and removed at the end.
-Log (stdout, and --log if given): "=== START g2h", "=== DONE g2h", "=== FAILED g2h".
-Exit codes: 0 done; 1 no audio (no file, an empty one, or no speech in it); 2 failure.
+place it elsewhere); <out without its extension>.partial.txt (rec.txt -> rec.partial.txt) is written chunk by chunk
+while running and removed at the end.
+Log (stdout, and --log if given): "=== START g2h", "=== DONE g2h", "=== FAILED g2h"; a line with "!" is a warning.
+Exit codes: 0 done; 1 no audio (no file, an empty one, or no speech in it); 2 failure, a wrong argument included.
 """
 import argparse
 import ctypes
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -41,6 +44,7 @@ import sys
 import tempfile
 import time
 import traceback
+import unicodedata
 import wave
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -55,6 +59,7 @@ BEAM, PRUNE, NBEST, ENDING = 16, 10.0, 5, 3     # beam width, frame pruning, tok
 DEFAULT_W = 3
 DEFAULT_RESERVE = 4
 DEFAULT_THREADS = 16
+VAD_TIMEOUT = 3600                  # s; the VAD pass of a 2.5-hour recording takes about 10 s
 EXIT_OK, EXIT_NO_AUDIO, EXIT_FAILED = 0, 1, 2
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 NEG = float('-inf')
@@ -66,14 +71,19 @@ class NoAudio(Exception):
 
 
 def log(msg):
+    global LOG_PATH
     line = '[%s] %s' % (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), msg)
     try:
         print(line, flush=True)
     except (OSError, ValueError):    # a detached process may have no usable console
         pass
     if LOG_PATH:
-        with open(LOG_PATH, 'a', encoding='utf-8') as f:
-            f.write(line + '\n')
+        try:
+            with open(LOG_PATH, 'a', encoding='utf-8') as f:
+                f.write(line + '\n')
+        except OSError as e:         # the log file is an extra: losing it in the middle of a run must not decide the run
+            lost, LOG_PATH = LOG_PATH, None
+            log('    ! cannot write the log file %s (%s): the log goes on to stdout only' % (lost, e))
 
 
 def fmt(sec):
@@ -188,8 +198,11 @@ def vad_chunks(audio_path, limit_sec, vad_python):
         cmd = [str(vad_python), str(Path(__file__).resolve()), '--vad-only', tmp, '--audio', str(audio_path)]
         if limit_sec:
             cmd += ['--limit-sec', repr(limit_sec)]
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', env=env,
-                           creationflags=NO_WINDOW)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', env=env,
+                               creationflags=NO_WINDOW, timeout=VAD_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError('VAD under %s did not finish in %d s' % (vad_python, VAD_TIMEOUT)) from None
         if r.returncode != 0 or not Path(tmp).stat().st_size:
             raise RuntimeError('VAD under %s failed (code %s):\n%s' % (vad_python, r.returncode, (r.stdout + r.stderr)[-2000:]))
         data = json.loads(Path(tmp).read_text(encoding='utf-8'))
@@ -211,8 +224,14 @@ def read_wav(path, limit_sec=0):
 # ---------------------------------------------------------------- dictionary -> tokens
 
 def load_terms(path):
-    """One term per line, spelled as it should appear in the transcript; '#' starts a comment."""
-    return [t for t in (line.split('#')[0].strip() for line in Path(path).read_text(encoding='utf-8').splitlines()) if t]
+    """UTF-8, one term per line, spelled as it should appear in the transcript; '#' starts a comment. What an editor hides is
+    cleaned: invisible format characters (a byte order mark, a zero-width space, a soft hyphen), no-break and doubled
+    spaces; a repeated term counts once."""
+    terms = []
+    for line in Path(path).read_text(encoding='utf-8').splitlines():
+        term = ''.join(ch for ch in line.split('#')[0] if unicodedata.category(ch) != 'Cf')
+        terms.append(' '.join(term.split()))
+    return list(dict.fromkeys(t for t in terms if t))
 
 
 def is_abbrev(term):
@@ -220,8 +239,10 @@ def is_abbrev(term):
 
 
 def term_forms(term):
-    """Forms of a term: as written; a term not in capitals also with a lower-case and an upper-case first letter."""
-    if is_abbrev(term):
+    """Forms of a term: as written; also with a lower-case and an upper-case first letter — unless the term is in capitals
+    or its first word has a capital after the first letter (an abbreviation, a brand): that spelling is deliberate."""
+    head = re.split(r'[\s\-]', term, maxsplit=1)[0]
+    if is_abbrev(term) or head[1:] != head[1:].lower():
         return [term]
     return list(dict.fromkeys([term, term[0].lower() + term[1:], term[0].upper() + term[1:]]))
 
@@ -273,6 +294,10 @@ class Lexicon:
     def sequences(self):
         return sum(len(s) for _, _, s in self.forms)
 
+    def unusable(self):
+        """Forms without a single usable split: the bonus never applies to them."""
+        return [f for _, f, s in self.forms if not s]
+
 
 # ---------------------------------------------------------------- decoders
 
@@ -280,11 +305,18 @@ class Lexicon:
 # end, tokens already secured). Mode 0: outside a form; 1: walking a form from a word start; 2: the form is complete
 # and the word goes on with an ending (at most ENDING letters).
 INIT = (0, -1, 0, 0, 0, 0)
+LOCK = -1         # "letters after the form end": a new word has followed the complete form, its bonus cannot be lost any more
 
 
 def step(lex, st, c):
     """Bonus state after token c: +w for every token of a form walked from a word start; leaving a form before its end
-    drops what the form collected, completing it keeps it; an ending of up to ENDING letters may follow."""
+    drops what the form collected, completing it keeps it; an ending of up to ENDING letters may follow. A complete form
+    keeps its bonus when the walk goes on into a longer form ("ВМС" inside "ВМС на борту") and leaves it later.
+
+    NB: one form is walked at a time. While a longer form is still matching, a term that begins at a word start inside it
+    is not started: with the terms "НДФЛ" and "ставка НДС", "ставка НДФЛ" gives "НДФЛ" no bonus — the text is as without
+    the dictionary. Left so on purpose: on three recorded meetings (about 7 hours of speech) this happened once, and a
+    second walk from every word start changes the decoding with any dictionary, so it needs a re-check on recordings."""
     mode, node, depth, lcd, tl, fin = st
     ws, lt = lex.ws[c], lex.letters[c]
     if mode == 1:
@@ -292,10 +324,14 @@ def step(lex, st, c):
         if nxt is not None:
             if lex.terminal[nxt] is not None:
                 return (1, nxt, depth + 1, depth + 1, 0, fin)
+            if tl == LOCK or (lcd and ws and tl <= ENDING):      # the walk goes on into a longer form over a word start
+                return (1, nxt, depth + 1, lcd, LOCK, fin)
             return (1, nxt, depth + 1, lcd, tl + lt, fin)
-        if lcd and not ws and tl + lt <= ENDING:
+        if lcd and tl == LOCK:
+            fin += lcd
+        elif lcd and not ws and tl + lt <= ENDING:
             return (2, -1, 0, lcd, tl + lt, fin)
-        if lcd and ws and tl <= ENDING:
+        elif lcd and ws and tl <= ENDING:
             fin += lcd
     elif mode == 2:
         if not ws:
@@ -330,10 +366,12 @@ def beam_decode(lex, logp, w, beam=BEAM, prune=PRUNE, reserve=0):
     maximum over alignments, not the sum; with beam 1 and w = 0 this is exactly greedy decoding. logp: [T, C] log-
     probabilities, the blank is the last class.
 
-    reserve: beam slots kept for the best hypotheses ranked without the bonus of an unfinished term. Without them a
-    hypothesis that has spelled the beginning of a term keeps that bonus while it waits on blanks, and hypotheses like it
-    can push the plain continuation of the speech out of the beam; when the term never completes, the words after it are
-    lost. 0 — the search as before (every slot ranked with the bonus)."""
+    reserve: beam slots kept for the hypotheses that are best by the acoustic score alone, without any term bonus, a
+    secured one included. Without them a hypothesis that has spelled the beginning of a term keeps that bonus while it
+    waits on blanks, and hypotheses like it can push the plain continuation of the speech out of the beam; when the term
+    never completes, the words after it are lost. The limit: once a term has been corrected in a chunk, the reserved
+    slots guard the paths without that correction, and the plain continuation of the corrected path can still be pushed
+    out. 0 — the search as before (every slot ranked with the bonus)."""
     import numpy as np
     T, C = logp.shape
     blank = C - 1
@@ -406,6 +444,7 @@ class Decoder:
     def __init__(self, sp, terms=None, w=DEFAULT_W, dict_name='', reserve=DEFAULT_RESERVE):
         self.sp, self.w, self.reserve = sp, w, reserve
         self.lex = Lexicon(sp, terms) if terms else None
+        self.unusable = self.lex.unusable() if self.lex else []
         if self.lex:
             self.desc = ('CTC prefix beam search (best alignment), beam %d, prune -%g%s; dictionary %s: %d terms, %d token '
                          'sequences; w = %g' % (BEAM, PRUNE, ', reserve %d' % reserve if reserve else '', dict_name,
@@ -418,6 +457,15 @@ class Decoder:
 
     def text(self, logp):
         return self.sp.decode_ids(self.ids(logp)).strip()
+
+
+def make_decoder(sp, a, terms):
+    """The decoder of a run. A form the bonus never applies to does not stop the run — the transcript is right without
+    it — but the log names it: otherwise only a separate --dict-check would tell."""
+    dec = Decoder(sp, terms, a.w, a.dict.name if a.dict else '', a.reserve)
+    if dec.unusable:
+        log('    ! dictionary forms the bonus never applies to: %s (see --dict-check)' % ', '.join(dec.unusable))
+    return dec
 
 
 # ---------------------------------------------------------------- word times and confidence
@@ -468,7 +516,8 @@ def ctc_align(logp, ids):
 
 def frame_clock(T, samples=None, parts=None, start=0.0, end=0.0):
     """Frame index of a chunk -> time in the recording. A chunk is its speech parts glued together, so the time goes
-    through the parts; without them — linearly between the chunk's start and end."""
+    through the parts; without them — linearly between the chunk's start and end. A point on the joint of two parts is
+    the start of the next part; for the end of a word (is_end) it is the end of the part before the joint."""
     if parts:
         total = samples or sum(e - s for s, e in parts)
         spans, acc = [], 0
@@ -476,14 +525,14 @@ def frame_clock(T, samples=None, parts=None, start=0.0, end=0.0):
             spans.append((acc, s, e))
             acc += e - s
 
-        def clock(f):
+        def clock(f, is_end=False):
             x = min(max(f * total / T, 0.0), float(acc))
             for a0, s, e in spans:
-                if x <= a0 + (e - s):
+                if x < a0 + (e - s) or (is_end and x == a0 + (e - s)):
                     return (s + x - a0) / SR
             return parts[-1][1] / SR
         return clock
-    return lambda f: start + (end - start) * min(max(f / T, 0.0), 1.0)
+    return lambda f, is_end=False: start + (end - start) * min(max(f / T, 0.0), 1.0)
 
 
 def chunk_words(sp, logp, ids, clock):
@@ -501,8 +550,8 @@ def chunk_words(sp, logp, ids, clock):
             words[-1][0].append(c)
             words[-1][2] = f1
             words[-1][3].append(lp)
-    out = [[sp.decode_ids(w_ids).strip(), round(clock(f0), 2), round(clock(f1 + 1), 2), round(float(np.exp(np.mean(lps))), 3)]
-           for w_ids, f0, f1, lps in words]
+    out = [[sp.decode_ids(w_ids).strip(), round(clock(f0), 2), round(clock(f1 + 1, True), 2),
+            round(float(np.exp(np.mean(lps))), 3)] for w_ids, f0, f1, lps in words]
     return round(float(np.exp(np.mean([lp for _, _, lp in al]))), 3), [w for w in out if w[0]]
 
 
@@ -540,9 +589,10 @@ def write_outputs(out, srt, title, info, segs):
 def save_logprobs(path, lps, segs, meta):
     import numpy as np
     arrays = {'c%04d' % i: lp for i, lp in enumerate(lps)}
-    np.savez(path, starts=np.array([a for a, _, _ in segs], dtype=np.float64),
-             ends=np.array([b for _, b, _ in segs], dtype=np.float64), meta=np.array(json.dumps(meta, ensure_ascii=False)),
-             **arrays)
+    with open(path, 'wb') as f:          # np.savez(path) adds ".npz" to a name without it; an open file is written as it is
+        np.savez(f, starts=np.array([a for a, _, _ in segs], dtype=np.float64),
+                 ends=np.array([b for _, b, _ in segs], dtype=np.float64), meta=np.array(json.dumps(meta, ensure_ascii=False)),
+                 **arrays)
     log('    CTC log-probabilities saved: %s (%.0f MB)' % (path, Path(path).stat().st_size / 2**20))
 
 
@@ -572,8 +622,22 @@ def load_logprobs(path):
 
 # ---------------------------------------------------------------- runs
 
+def preflight(a):
+    """The cheap checks first: a wrong output path fails the run now, not after hours of recognition."""
+    for flag, p in (('--out', a.out), ('--srt', a.srt), ('--words', a.words), ('--keep-logprobs', a.keep_logprobs)):
+        if p and (p.is_dir() or not p.parent.is_dir()):
+            raise RuntimeError('%s %s: the folder does not exist, or the path is a folder' % (flag, p))
+
+
 def partial_path(out):
     return Path(out).with_name(Path(out).stem + '.partial.txt')
+
+
+def drop_partial(part):
+    try:
+        part.unlink(missing_ok=True)
+    except OSError as e:             # a viewer may hold it open: the transcript is complete, the partial file just stays
+        log('    ! the partial file stays: %s (%s)' % (part, e))
 
 
 def run_audio(a, terms):
@@ -582,11 +646,11 @@ def run_audio(a, terms):
     if not a.audio or not a.audio.is_file() or a.audio.stat().st_size == 0:
         raise NoAudio('no audio file: %s' % a.audio)
     t_start = time.time()
+    audio = read_wav(a.audio, a.limit_sec)                   # the format check is cheap: before the VAD pass
     data = vad_chunks(a.audio, a.limit_sec, a.vad_python or default_vad_python())
     chunks = data['chunks']
     if not chunks:
         raise NoAudio('no speech found in %s' % a.audio)
-    audio = read_wav(a.audio, a.limit_sec)
     if len(audio) != data['audio_samples'] or audio_digest(audio) != data['audio_sha1']:
         raise RuntimeError('the audio read here differs from the audio the VAD read')
     log('    audio %s, chunks %d, longest %.2f s' % (fmt(len(audio) / SR), len(chunks), max(c['samples'] for c in chunks) / SR))
@@ -598,7 +662,7 @@ def run_audio(a, terms):
     model = gigaam.load_model(MODEL_NAME, fp16_encoder=False, use_flash=False, device='cpu', download_root=str(a.models))
     load_sec = time.time() - t_load
     sp = load_tokenizer(a.models)
-    dec = Decoder(sp, terms, a.w, a.dict.name if a.dict else '', a.reserve)
+    dec = make_decoder(sp, a, terms)
     log('    GigaAM %s loaded in %.0f s (%.0fM parameters), torch threads %d; decoder: %s' % (
         MODEL_NAME, load_sec, sum(p.numel() for p in model.parameters()) / 1e6, torch.get_num_threads(), dec.desc))
     segs, lps, empty, mism, wchunks = [], [], 0, [], []
@@ -649,7 +713,7 @@ def run_audio(a, terms):
                                                    'faster_whisper': data['faster_whisper'], 'vad_parameters': data['vad_parameters'],
                                                    'limit_sec': a.limit_sec, 'threads': a.threads, 'greedy_mismatch': mism,
                                                    'samples': [c['samples'] for c in chunks], 'parts': [c['parts'] for c in chunks]})
-    part.unlink(missing_ok=True)
+    drop_partial(part)
     return len(segs), empty, total
 
 
@@ -658,7 +722,11 @@ def run_logprobs(a, terms):
     t_start = time.time()
     lps, starts, ends, meta = load_logprobs(a.from_logprobs)
     sp = load_tokenizer(a.models)
-    dec = Decoder(sp, terms, a.w, a.dict.name if a.dict else '', a.reserve)
+    classes = sorted({lp.shape[1] for lp in lps} - {sp.get_piece_size() + 1})
+    if classes:                          # with fewer classes a token would be read as the blank: another text, silently
+        raise RuntimeError('%s has %s classes per frame, the tokenizer has %d tokens and the blank: saved by another model?' % (
+            a.from_logprobs, classes, sp.get_piece_size()))
+    dec = make_decoder(sp, a, terms)
     log('    %d chunks from %s; decoder: %s' % (len(lps), a.from_logprobs, dec.desc))
     segs, wchunks = [], []
     parts, samples = meta.get('parts'), meta.get('samples')
@@ -677,14 +745,14 @@ def run_logprobs(a, terms):
             pf.write('[%s → %s] %s\n' % (fmt(s), fmt(e), segs[-1][2]))
             pf.flush()
     empty, total = sum(1 for _, _, t in segs if not t), time.time() - t_start
-    info = 'Generated %s by g2h: re-decoded from %s (GigaAM %s); decoder: %s; chunks %d, empty %d; time %s' % (
-        datetime.now().isoformat(timespec='seconds'), Path(a.from_logprobs).name, meta.get('model', MODEL_NAME), dec.desc,
-        len(segs), empty, fmt(total))
+    info = 'Generated %s by g2h: re-decoded from %s (GigaAM %s%s); decoder: %s; chunks %d, empty %d; time %s' % (
+        datetime.now().isoformat(timespec='seconds'), Path(a.from_logprobs).name, meta.get('model', MODEL_NAME),
+        ', first %g s only' % meta['limit_sec'] if meta.get('limit_sec') else '', dec.desc, len(segs), empty, fmt(total))
     write_outputs(a.out, a.srt, a.title or 'Transcript re-decoded from %s' % Path(a.from_logprobs).name, info, segs)
     if a.words:
         write_words(a.words, {'audio': meta.get('audio', Path(a.from_logprobs).name), 'model': meta.get('model', MODEL_NAME),
                               'decoder': dec.desc, 'approximate_times': not parts}, wchunks)
-    part.unlink(missing_ok=True)
+    drop_partial(part)
     return len(segs), empty, total
 
 
@@ -699,7 +767,7 @@ def dict_check(a, terms):
         print('  %-*s  %s' % (width, form, ' ; '.join(' '.join(s) for s in seqs) or '— no usable split'))
     for term, form, pieces, why in lex.rejected:
         print('  rejected: %s (%s): %s — %s' % (form, term, ' '.join(pieces), why))
-    unusable = [f for _, f, s in lex.forms if not s]
+    unusable = lex.unusable()
     if unusable:
         print('Forms the bonus never applies to: %s' % ', '.join(unusable))
     return EXIT_FAILED if unusable else EXIT_OK
@@ -711,10 +779,11 @@ def parse_args(argv=None):
     ap.add_argument('--out', type=Path, help='transcript to write')
     ap.add_argument('--srt', type=Path, help='subtitles to write (default: next to --out)')
     ap.add_argument('--title', help='first header line of the transcript')
-    ap.add_argument('--dict', type=Path, help='term dictionary: one term per line (without it: plain greedy GigaAM)')
+    ap.add_argument('--dict', type=Path, help='term dictionary: UTF-8, one term per line (without it: plain greedy GigaAM)')
     ap.add_argument('--w', type=float, default=DEFAULT_W, help='bonus per term token (default %(default)g)')
     ap.add_argument('--reserve', type=int, default=DEFAULT_RESERVE, metavar='K',
-                    help='beam slots kept for hypotheses ranked without the bonus of an unfinished term (default %(default)d; 0 turns it off)')
+                    help='beam slots kept for the hypotheses that are best by the acoustic score alone, without any term bonus '
+                         '(default %(default)d; 0 turns it off)')
     ap.add_argument('--words', type=Path, metavar='JSON', help='also write word times and confidences (chunks → words)')
     ap.add_argument('--threads', type=int, default=DEFAULT_THREADS, help='torch CPU threads (default %(default)d)')
     ap.add_argument('--keep-logprobs', type=Path, metavar='NPZ', help='also save the CTC log-probabilities')
@@ -726,32 +795,48 @@ def parse_args(argv=None):
     ap.add_argument('--vad-python', type=Path, help='Python with faster-whisper (default: the main Python behind this venv)')
     ap.add_argument('--vad-only', metavar='JSON', help=argparse.SUPPRESS)    # internal: the main-Python VAD step
     a = ap.parse_args(argv)
+    for wrong, why in ((a.reserve < 0, '--reserve cannot be negative'), (a.limit_sec < 0, '--limit-sec cannot be negative'),
+                       (a.threads < 1, '--threads starts at 1'),
+                       (not (a.w >= 0 and math.isfinite(a.w)), '--w is a finite number, 0 or more')):
+        if wrong:                        # accepted, these values would silently change what the run does
+            ap.error(why)
     if a.vad_only or a.dict_check:
         if a.dict_check and not a.dict:
             ap.error('--dict-check needs --dict')
         return a
     if not a.out or not (a.audio or a.from_logprobs) or (a.audio and a.from_logprobs):
         ap.error('give --out and exactly one of --audio / --from-logprobs')
+    if not a.out.name:
+        ap.error('--out must be a file: %s' % a.out)
     a.srt = a.srt or a.out.with_suffix('.srt')
+    if a.srt == a.out:
+        ap.error('--out and the subtitles are the same file (%s): give --srt or another --out' % a.out)
     return a
 
 
 def main(argv=None):
     global LOG_PATH
-    if sys.stdout:
-        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    LOG_PATH = None
+    reconfigure = getattr(sys.stdout, 'reconfigure', None)       # a console or a pipe has it; an embedding caller may not
+    if reconfigure:
+        reconfigure(encoding='utf-8', errors='replace')
     a = parse_args(argv)
     if a.vad_only:
         make_chunks(a.audio, a.limit_sec, a.vad_only)
         return EXIT_OK
-    terms = load_terms(a.dict) if a.dict else []
-    if a.dict_check:
-        return dict_check(a, terms)
-    LOG_PATH = a.log
-    keep_awake()
-    src = a.audio if a.audio else a.from_logprobs
-    log('=== START g2h: %s -> %s%s' % (src, a.out, ' (dictionary %s, %d terms, w = %g)' % (a.dict.name, len(terms), a.w) if terms else ''))
-    try:
+    try:                                 # whatever fails from here on is exit code 2 with the marker, never the "no audio" code 1
+        terms = load_terms(a.dict) if a.dict else []
+        if a.dict_check:
+            return dict_check(a, terms)
+        preflight(a)
+        if a.log:
+            with open(a.log, 'a', encoding='utf-8'):     # a log that cannot be written fails the run now, not after hours
+                pass
+        LOG_PATH = a.log
+        keep_awake()
+        src = a.audio if a.audio else a.from_logprobs
+        log('=== START g2h: %s -> %s%s' % (
+            src, a.out, ' (dictionary %s, %d terms, w = %g)' % (a.dict.name, len(terms), a.w) if terms else ''))
         n, empty, total = run_audio(a, terms) if a.audio else run_logprobs(a, terms)
     except NoAudio as e:
         log('=== FAILED g2h: %s' % e)
