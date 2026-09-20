@@ -36,11 +36,14 @@ bonus to the paths that spell a known term, and the acoustic evidence still deci
    - Without a dictionary: greedy CTC, exactly GigaAM's own decoding.
    - With a dictionary: a CTC prefix beam search. The score of a hypothesis is its best alignment (the maximum over
      alignments rather than their sum), the beam is 16 wide, and on every frame the blank and the tokens within 10 of
-     the frame's best log-probability are tried. Every term is split into SentencePiece tokens (up to five splits per
-     form; a term also gets lower-case and capitalised first-letter forms, unless it is written in capitals or its
-     first word is an abbreviation, as in "ТТН на возврат"). A hypothesis gets
-     `w` for every token of a term it spells from the start of a word; leaving a term before its end takes the bonus
-     back, completing it keeps it, and an ending of up to three letters may follow ("НДС" → "НДСы").
+     the frame's best log-probability are tried; a token with letters that spells a dictionary term is tried only
+     within 5, so the bonus does not write a term over frames that do not sound like it. Every term is split into
+     SentencePiece tokens (up to five splits per form). A term written in lower case also gets a form with a capital
+     first letter, for the start of a sentence; a term that begins with a capital (a name: "Озон"), is written in
+     capitals or has a capital inside its first word (an abbreviation, a brand: "ТТН на возврат", "ePASS") is spelled
+     only as written. A hypothesis gets `w` for every token of a term it spells from the start of a word; leaving a
+     term before its end takes the bonus back, completing it keeps it, and an ending of up to four letters may follow
+     ("НДС" → "НДСы").
    - With `w = 0` the beam search returns the greedy result at any beam width; the tests check this.
 
 ## Requirements
@@ -85,7 +88,7 @@ venv/Scripts/python g2h.py --audio meeting.wav --out meeting.txt --dict terms.tx
 | `--srt` | where to write the subtitles (default: next to `--out`) |
 | `--title` | the first header line of the transcript |
 | `--dict`, `--w` | the term dictionary and the bonus per term token (default 3); without `--dict` — plain GigaAM |
-| `--reserve K` | beam slots kept for the hypotheses that are best by the acoustic score alone, without any term bonus (default 4; 0 turns it off); see "The dictionary" |
+| `--reserve K` | beam slots kept for the hypotheses that are best by the acoustic score plus the bonus of the terms they have completed, not of a term still being spelled (default 4; 0 turns it off); see "The dictionary" |
 | `--words JSON` | also write word times and confidences: `{"chunks": [{"start", "end", "conf", "words": [[word, start, end, conf], …]}]}` |
 | `--threads` | torch CPU threads (default 16) |
 | `--keep-logprobs NPZ` | also save the CTC output of every chunk (about 200 MB for 2.5 hours) |
@@ -115,6 +118,13 @@ A UTF-8 text file, one term per line, written the way it should appear in the tr
 no-break and doubled spaces — is cleaned on reading, and a repeated term counts once. Put in only the terms that are
 actually said and that plain decoding gets wrong: every term is a path the decoder is invited to take.
 
+Two kinds of entries do harm. An ordinary word the model writes by itself: only the dictionary form gets the bonus, so
+the word is rewritten into that form and its ending changes ("номенклатуры" → "номенклатура", a genitive turned into
+the nominative); on three recorded meetings five such words gave no confirmed fix and most of the changed endings. A
+term of two letters: its tokens are frequent sounds, and it gets written into other words — of about 20 new
+occurrences of one such term 6–7 were right. Write a name with a capital ("Озон"): it is then spelled only that way;
+a term in lower case also gets the capitalised form.
+
 `w` trades terms against speech. A small bonus fixes a term the model was unsure about; a large one lets a hypothesis
 that has spelled the beginning of a term push the real continuation out of the beam — if the term never completes,
 the words after it are lost. Check a dictionary before relying on it:
@@ -125,17 +135,19 @@ the words after it are lost. Check a dictionary before relying on it:
 3. compare: the dictionary version should keep at least 99 % of the words of the plain one, and no term should appear
    where nothing was said (a run of dictionary terms in a row is the typical sign).
 
-`--reserve K` removes that loss: K beam slots are kept for the hypotheses that are best by the acoustic score alone,
-without any term bonus, so the plain continuation of the speech stays in the beam, and a term that never completes
-loses to it at the end of the chunk. The reserve has a limit: once the dictionary has corrected a term in a chunk, the
-reserved slots guard the paths without that correction, and the plain continuation of the corrected path can still be
-pushed out of the beam. On three recorded meetings (1 h 50 min to 2 h 47 min each, a 36-term dictionary), checked
+`--reserve K` removes that loss: K beam slots are kept for the hypotheses that are best by the acoustic score plus the
+bonus they would keep if the chunk ended now — the terms they have completed, not a term still being spelled. The
+plain continuation of the speech stays in the beam, and a term that never completes loses to it at the end of the
+chunk; a corrected term counts in the reserve, so the reserved slots follow the corrected path and its continuation
+stays in the beam too. On three recorded meetings (1 h 50 min to 2 h 47 min each, about 7 hours of speech), checked
 against an independent Whisper transcript: `w = 2` without a reserve lost 9 phrases (112 words); with `--reserve 4`
-no phrase was lost at `w = 2` or `w = 3`, and `w = 3 --reserve 4` fixed 39 term spellings against 28 at `w = 1`
-without a reserve, with 1 confirmed worsening against 2. Full runs of the same three recordings (sound → chunks →
-encoder → decoder) matched the re-decoding word for word, so `w = 3 --reserve 4` is the default; `--w 1 --reserve 0`
-reproduces the earlier default. The setting was checked with one 36-term dictionary: check yours (the three steps
-above and `--dict-check`) before relying on it.
+no phrase was lost. At `w = 3 --reserve 4`, the default, a 33-term dictionary fixed 44 term spellings with no
+confirmed worsening, and outside the terms it lost no word and distorted one against plain decoding. What remains is
+7–8 false short terms per 7 hours — a three-letter abbreviation in place of a similar-sounding one — so read short
+abbreviations against a second transcript where they matter. A full run of a recording (sound → chunks → encoder →
+decoder) matches the re-decoding of its saved CTC output word for word; `--w 1 --reserve 0` reproduces the default
+before 18.09.2026. The setting was checked with one dictionary: check yours (the three steps above and
+`--dict-check`) before relying on it.
 
 `--dict-check` shows whether every form of every term has a usable token split; a form without one never gets the
 bonus. Its exit code is 2 when there is such a form and 0 otherwise; an ordinary run names these forms in its log and

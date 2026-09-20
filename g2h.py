@@ -11,10 +11,10 @@ Pipeline:
   2. Every chunk goes through the GigaAM v3_e2e_ctc encoder on the CPU.
   3. Decoding. Without a dictionary: greedy CTC, exactly GigaAM's own. With one: a CTC prefix beam search whose
      hypothesis score is its best alignment (the maximum over alignments, not the sum), beam 16; on every frame the
-     blank and the tokens within 10 of the frame's best log-probability are tried. A bonus of w is added for every
-     token of a dictionary term that starts a word; a hypothesis that leaves the term before its end loses the bonus,
-     one that completes it keeps it, and an ending of up to 3 letters may follow ("НДС" -> "НДСы"). With w = 0 the
-     search returns the greedy result at any beam width.
+     blank and the tokens within 10 of the frame's best log-probability are tried — a token with letters that walks a
+     dictionary term only within 5. A bonus of w is added for every token of a dictionary term that starts a word; a
+     hypothesis that leaves the term before its end loses the bonus, one that completes it keeps it, and an ending of
+     up to 4 letters may follow ("НДС" -> "НДСы"). With w = 0 the search returns the greedy result at any beam width.
 
 Usage (python: the interpreter of the GigaAM virtual environment):
   python g2h.py --audio rec.wav --out rec.txt [--dict terms.txt] [--w 3] [--reserve 4] [--title "..."] [--log run.log]
@@ -55,7 +55,8 @@ CHUNK_SEC = 25
 VAD_PARAMETERS = {'min_silence_duration_ms': 500}
 MODEL_NAME = 'v3_e2e_ctc'
 TOKENIZER_FILE = MODEL_NAME + '_tokenizer.model'
-BEAM, PRUNE, NBEST, ENDING = 16, 10.0, 5, 3     # beam width, frame pruning, token splits per form, ending letters
+BEAM, PRUNE, NBEST, ENDING = 16, 10.0, 5, 4     # beam width, frame pruning, token splits per form, ending letters
+TERM_PRUNE = 5.0                   # frame pruning of a token with letters that walks a dictionary form (the rest: PRUNE)
 DEFAULT_W = 3
 DEFAULT_RESERVE = 4
 DEFAULT_THREADS = 16
@@ -239,12 +240,13 @@ def is_abbrev(term):
 
 
 def term_forms(term):
-    """Forms of a term: as written; also with a lower-case and an upper-case first letter — unless the term is in capitals
-    or its first word has a capital after the first letter (an abbreviation, a brand): that spelling is deliberate."""
+    """Forms of a term: as written; a term that begins with a lower-case letter also with an upper-case one (the start of a
+    sentence). A term that begins with a capital (a name), is in capitals or has a capital after the first letter of its first
+    word (an abbreviation, a brand) is spelled as written only: that spelling is deliberate."""
     head = re.split(r'[\s\-]', term, maxsplit=1)[0]
-    if is_abbrev(term) or head[1:] != head[1:].lower():
+    if is_abbrev(term) or head != head.lower():
         return [term]
-    return list(dict.fromkeys([term, term[0].lower() + term[1:], term[0].upper() + term[1:]]))
+    return list(dict.fromkeys([term, term[0].upper() + term[1:]]))
 
 
 class Lexicon:
@@ -366,18 +368,25 @@ def beam_decode(lex, logp, w, beam=BEAM, prune=PRUNE, reserve=0):
     maximum over alignments, not the sum; with beam 1 and w = 0 this is exactly greedy decoding. logp: [T, C] log-
     probabilities, the blank is the last class.
 
-    reserve: beam slots kept for the hypotheses that are best by the acoustic score alone, without any term bonus, a
-    secured one included. Without them a hypothesis that has spelled the beginning of a term keeps that bonus while it
-    waits on blanks, and hypotheses like it can push the plain continuation of the speech out of the beam; when the term
-    never completes, the words after it are lost. The limit: once a term has been corrected in a chunk, the reserved
-    slots guard the paths without that correction, and the plain continuation of the corrected path can still be pushed
-    out. 0 — the search as before (every slot ranked with the bonus)."""
+    A token is tried on a frame within prune of the frame's best log-probability; a token with letters that walks a
+    dictionary form (starts it from a word start, continues or completes it) — only within TERM_PRUNE: the bonus does not
+    write a term over frames that do not sound like it. A token without letters (the bare word mark inside "ТН ВЭД" said in
+    one breath) stays under prune. The bonus state is still a function of the prefix: the rule narrows the alignments that
+    are tried, not the score; the greedy path is never cut, its tokens are the best of their frames.
+
+    reserve: beam slots kept for the hypotheses that are best by the acoustic score plus the bonus they would keep if the
+    chunk ended now (final_bonus: secured terms and a complete one); the bonus of a term still being spelled does not
+    count. Without them a hypothesis that has spelled the beginning of a term keeps that bonus while it waits on blanks,
+    and hypotheses like it can push the plain continuation of the speech out of the beam; when the term never completes,
+    the words after it are lost. A corrected term counts in the reserve, so the reserved slots follow the corrected path
+    and its plain continuation stays in the beam. 0 — the search as before (every slot ranked with the live bonus)."""
     import numpy as np
     T, C = logp.shape
     blank = C - 1
     parent, token, state, kids = [-1], [-1], [INIT], [{}]
     beams = [(0, 0.0, NEG)]
     thr = logp.max(axis=1) - prune
+    weak = logp.max(axis=1) - TERM_PRUNE
     for t in range(T):
         lp = logp[t]
         cand = [int(c) for c in np.nonzero(lp >= thr[t])[0] if c != blank]
@@ -401,11 +410,14 @@ def beam_decode(lex, logp, w, beam=BEAM, prune=PRUNE, reserve=0):
                 else:
                     val = ptot + p
                 cid = kids[pid].get(c)
+                st = step(lex, state[pid], c) if cid is None else state[cid]
+                if st[0] == 1 and lex.letters[c] and p < weak[t]:      # a dictionary token this frame does not support
+                    continue
                 if cid is None:
                     cid = len(parent)
                     parent.append(pid)
                     token.append(c)
-                    state.append(step(lex, state[pid], c))
+                    state.append(st)
                     kids.append({})
                     kids[pid][c] = cid
                 e = nxt.get(cid)
@@ -415,7 +427,7 @@ def beam_decode(lex, logp, w, beam=BEAM, prune=PRUNE, reserve=0):
                     e[1] = val
         ranked = sorted(nxt.items(), key=lambda kv: -(max(kv[1]) + w * live_bonus(state[kv[0]])))
         if reserve and w:
-            keep = sorted(nxt.items(), key=lambda kv: -max(kv[1]))[:min(reserve, beam)]
+            keep = sorted(nxt.items(), key=lambda kv: -(max(kv[1]) + w * final_bonus(state[kv[0]])))[:min(reserve, beam)]
             seen = {pid for pid, _ in keep}
             for kv in ranked:
                 if len(keep) >= beam:
@@ -782,8 +794,8 @@ def parse_args(argv=None):
     ap.add_argument('--dict', type=Path, help='term dictionary: UTF-8, one term per line (without it: plain greedy GigaAM)')
     ap.add_argument('--w', type=float, default=DEFAULT_W, help='bonus per term token (default %(default)g)')
     ap.add_argument('--reserve', type=int, default=DEFAULT_RESERVE, metavar='K',
-                    help='beam slots kept for the hypotheses that are best by the acoustic score alone, without any term bonus '
-                         '(default %(default)d; 0 turns it off)')
+                    help='beam slots kept for the hypotheses that are best by the acoustic score plus the bonus of the '
+                         'terms they have completed, not of a term still being spelled (default %(default)d; 0 turns it off)')
     ap.add_argument('--words', type=Path, metavar='JSON', help='also write word times and confidences (chunks → words)')
     ap.add_argument('--threads', type=int, default=DEFAULT_THREADS, help='torch CPU threads (default %(default)d)')
     ap.add_argument('--keep-logprobs', type=Path, metavar='NPZ', help='also save the CTC log-probabilities')

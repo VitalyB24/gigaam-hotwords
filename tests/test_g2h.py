@@ -99,6 +99,11 @@ def frames(steps):
     return lp - np.log(np.exp(lp).sum(axis=1, keepdims=True))
 
 
+def apart(d):
+    """Two probabilities that fill a frame, the second above the first by d in the logarithm."""
+    return 1 / (1 + math.exp(d)), math.exp(d) / (1 + math.exp(d))
+
+
 def rows_without_blanks(tokens):
     """A frame per token and no blank frames between them."""
     lp = np.full((len(tokens), C), -40.0)
@@ -168,6 +173,79 @@ def test_the_bonus_cannot_pull_in_a_pruned_token():
     assert SP.decode_ids(g2h.beam_decode(lex, lp, 5)) == 'ВМе'
 
 
+def test_a_dictionary_token_needs_acoustic_support():
+    # a token that walks a dictionary form is tried only within 5 of the frame's best: a bonus of 9 pays for a loss of 4.9 and
+    # would pay for 5.1, yet there the token is not tried; the reserve does not bring it back
+    lex = g2h.Lexicon(SP, ['ВМС'])
+    v, m, s, e = ids_of('▁В', 'М', 'С', 'е')
+    for d, text in ((4.9, 'ВМС'), (5.1, 'ВМе')):
+        p_lo, p_hi = apart(d)
+        lp = frames([{v: 1.0}, {m: 1.0}, {s: p_lo, e: p_hi}])
+        assert SP.decode_ids(g2h.beam_decode(lex, lp, 0)) == 'ВМе'
+        assert SP.decode_ids(g2h.beam_decode(lex, lp, 3)) == text
+        assert SP.decode_ids(g2h.beam_decode(lex, lp, 3, reserve=4)) == text
+
+
+def test_the_term_threshold_is_the_checked_setting():
+    # 5 together with the reserve ranking: checked on three recorded meetings; 4 loses confirmed fixes, the frame pruning of 10
+    # lets false short terms in
+    assert g2h.TERM_PRUNE == 5.0 and g2h.TERM_PRUNE < g2h.PRUNE
+
+
+def test_a_weak_first_token_does_not_start_a_term():
+    lex = g2h.Lexicon(SP, ['ВМС'])
+    v, f, m, s = ids_of('▁В', '▁Ф', 'М', 'С')
+    for d, text in ((4.0, 'ВМС'), (6.0, 'ФМС')):
+        p_lo, p_hi = apart(d)
+        assert SP.decode_ids(g2h.beam_decode(lex, frames([{v: p_lo, f: p_hi}, {m: 1.0}, {s: 1.0}]), 3)) == text
+
+
+def test_a_term_is_not_written_into_silence():
+    # three frames of silence where the letters of the term are each d below the blank. 3.5 each: the bonus pays (12 > 10.5) and
+    # every token is within the threshold, the term is written. 5.5 each: a bonus of 6 per token would pay, the tokens are not tried
+    lex = g2h.Lexicon(SP, ['ВМС'])
+    a, b = ids_of('▁а', '▁б')
+
+    def chunk(d):
+        p_lo, p_hi = apart(d)
+        return frames([{a: 1.0}] + [{tok: p_lo, BLANK: p_hi} for tok in ids_of('▁В', 'М', 'С')] + [{b: 1.0}])
+    assert SP.decode_ids(g2h.beam_decode(lex, chunk(3.5), 0)) == 'а б'
+    assert SP.decode_ids(g2h.beam_decode(lex, chunk(3.5), 4)) == 'а ВМС б'
+    assert SP.decode_ids(g2h.beam_decode(lex, chunk(5.5), 6)) == 'а б'
+
+
+def test_a_bare_word_mark_inside_a_term_is_outside_the_term_threshold():
+    # "ТН ВЭД" said in one breath: the bare "▁" between its words is weak on its frame. A token without letters is tried within
+    # the frame pruning, as before (7 below the best: tried, 12: not); a letter of the term 7 below the best is not tried
+    sp = SplitSP({'ТН ВЭД': [['▁Т', 'Н', '▁', 'В', 'Э', 'Д']]})
+    lex = g2h.Lexicon(sp, ['ТН ВЭД'])
+    t, n, mark, v, ee, d, e = (sp.index[p] for p in ('▁Т', 'Н', '▁', 'В', 'Э', 'Д', 'е'))
+
+    def chunk(space, letter):
+        return frames([{t: 1.0}, {n: 1.0}, space, {v: 1.0}, letter, {d: 1.0}])
+    for gap, text in ((7.0, 'ТН ВЭД'), (12.0, 'ТНВЭД')):
+        p_lo, p_hi = apart(gap)
+        lp = chunk({mark: p_lo, BLANK: p_hi}, {ee: 1.0})
+        assert sp.decode_ids(g2h.beam_decode(lex, lp, 0)) == 'ТНВЭД'
+        assert sp.decode_ids(g2h.beam_decode(lex, lp, 3)) == text
+    p_lo, p_hi = apart(7.0)
+    assert sp.decode_ids(g2h.beam_decode(lex, chunk({mark: 1.0}, {ee: p_lo, e: p_hi}), 3)) == 'ТН ВеД'
+
+
+def test_a_token_outside_a_term_is_tried_within_the_frame_pruning_as_before():
+    # after "ВМС" and an ending of ENDING letters one more letter loses the bonus, a space secures it. The space walks no
+    # dictionary form: 7 below the frame's best it is still tried, beyond PRUNE it is not (the bonus of 15 would pay for 12)
+    lex = g2h.Lexicon(SP, ['ВМС'])
+    ending = 'абвгежзик'[:g2h.ENDING]
+    word = ids_of('▁В', 'М', 'С', *ending)
+    letter, space = ids_of('д', '▁д')
+    for d, text in ((7.0, 'ВМС%s д' % ending), (12.0, 'ВМС%sд' % ending)):
+        p_lo, p_hi = apart(d)
+        lp = frames([{tok: 1.0} for tok in word] + [{space: p_lo, letter: p_hi}])
+        assert SP.decode_ids(g2h.beam_decode(lex, lp, 0)) == 'ВМС%sд' % ending
+        assert SP.decode_ids(g2h.beam_decode(lex, lp, 5)) == text
+
+
 def test_a_repeated_token_needs_a_blank_between():
     lex = g2h.Lexicon(SP, ['Анна'])                               # the dictionary spells the doubled letter, the frames do not
     a1, n, a2 = ids_of('▁А', 'н', 'а')
@@ -195,7 +273,7 @@ def test_unfinished_term_has_no_bonus_at_the_end_of_a_chunk_search():
     assert SP.decode_ids(g2h.beam_decode(lex, lp, 2)) == 'Ве'
 
 
-@pytest.mark.parametrize('ending, kept', [('', True), ('ом', True), ('ами', True), ('скую', False), ('ского', False)])
+@pytest.mark.parametrize('ending, kept', [('', True), ('ом', True), ('ами', True), ('ными', True), ('ского', False)])
 def test_ending_after_a_term(ending, kept):
     lex = g2h.Lexicon(SP, ['ВМС'])
     term = ids_of('▁В', 'М', 'С')
@@ -207,8 +285,20 @@ def test_an_ending_is_counted_in_letters_not_in_tokens():
     sp = SplitSP()
     lex = g2h.Lexicon(sp, ['ВМС'])
     term = [sp.index[p] for p in ('▁В', 'М', 'С')]
-    assert g2h.final_bonus(final_state(lex, term + [sp.index['ск']])) == 3                    # 1 token, 2 letters: an ending
-    assert g2h.final_bonus(final_state(lex, term + [sp.index['ск'], sp.index['ую']])) == 0    # 2 tokens, 4 letters: another word
+    sk, uyu = sp.index['ск'], sp.index['ую']
+    assert g2h.final_bonus(final_state(lex, term + [sk, uyu])) == 3           # 2 tokens, 4 letters: an ending
+    assert g2h.final_bonus(final_state(lex, term + [sk, uyu, sk])) == 0       # 3 tokens, 6 letters: another word
+
+
+def test_a_four_letter_ending_keeps_the_word_whole():
+    # "ВМС" lives on its bonus, and every letter of the ending is cheap to skip. An ending the bonus does not reach is cut to the
+    # length it reaches: with three letters allowed the search wrote "ВМСным"
+    lex = g2h.Lexicon(SP, ['ВМС'])
+    v, m, s, e = ids_of('▁В', 'М', 'С', 'е')
+    p_lo, p_hi = apart(2.0)
+    lp = frames([{v: 1.0}, {m: 1.0}, {s: p_lo, e: p_hi}] + [{tok: 0.6, BLANK: 0.4} for tok in ids_of('н', 'ы', 'м', 'и')])
+    assert SP.decode_ids(g2h.beam_decode(lex, lp, 0)) == 'ВМеными'
+    assert SP.decode_ids(g2h.beam_decode(lex, lp, 3)) == 'ВМСными'
 
 
 def test_complete_term_keeps_its_bonus_before_the_next_word():
@@ -250,11 +340,27 @@ def test_a_longer_term_does_not_take_the_bonus_of_the_short_one():
 def test_forms_of_a_term():
     assert g2h.term_forms('ВМС') == ['ВМС']
     assert g2h.term_forms('наименование') == ['наименование', 'Наименование']
-    assert g2h.term_forms('Озон') == ['Озон', 'озон']
+    assert g2h.term_forms('Озон') == ['Озон']                                    # a name: no "озон"
+    assert g2h.term_forms('озон') == ['озон', 'Озон']
     assert g2h.term_forms('ТТН на возврат') == ['ТТН на возврат']                # an abbreviation first: no "тТН на возврат"
     assert g2h.term_forms('ЭДО-оператор') == ['ЭДО-оператор']
-    assert g2h.term_forms('В пути') == ['В пути', 'в пути']                      # a one-letter first word is not an abbreviation
+    assert g2h.term_forms('ePASS') == ['ePASS']                                  # a capital after the first letter: a brand
+    assert g2h.term_forms('В пути') == ['В пути']                                # begins with a capital: as written
+    assert g2h.term_forms('в пути') == ['в пути', 'В пути']
     assert g2h.term_forms('В ЭДО') == ['В ЭДО']                                  # all in capitals: as written
+
+
+def test_a_name_is_not_written_in_lower_case():
+    # "Озон" in the dictionary gives no bonus to "озон"; a term written in lower case takes the capital of a sentence start too
+    big, small, a, z, o, n = ids_of('▁О', '▁о', '▁а', 'з', 'о', 'н')
+    p_lo, p_hi = apart(1.0)
+
+    def text(term, first):
+        lp = frames([{first: p_lo, a: p_hi}, {z: 1.0}, {o: 1.0}, {n: 1.0}])
+        return SP.decode_ids(g2h.beam_decode(g2h.Lexicon(SP, [term]), lp, 3))
+    assert (text('Озон', big), text('Озон', small)) == ('Озон', 'азон')
+    assert (text('озон', big), text('озон', small)) == ('Озон', 'озон')
+    assert [f for _, f, _ in g2h.Lexicon(SP, ['Озон']).forms] == ['Озон']
 
 
 def test_forms_of_a_term_reach_the_tree():
@@ -421,16 +527,25 @@ def chunk_after_a_fix(d, crowd, p_o):
     return lex, frames([{v: 1.0}, {m: 1.0}, {s: p_lo, e: p_hi}, {k: 1.0}, second, {t: 1.0}, {y: 1.0}])
 
 
-def test_reserve_is_ranked_by_the_acoustic_score_alone():
-    # The reserve guards the paths that are best by the acoustic score and knows nothing of bonuses, a secured one included. After
-    # "ВМС" has won on its bonus, the reserved slots go to the "ВМе" paths, and the plain "Ко" of the winning path is crowded out
-    # by the terms "К?Я" that never complete: a known limit of the reserve. On recorded meetings (19.09.2026) this ranking held
-    # back false short terms better than a ranking that counts the secured bonus, so it stays until the term scoring is re-tuned.
+def test_reserve_counts_the_bonus_a_hypothesis_has_earned():
+    # The reserve guards the paths that are best by the acoustic score plus the bonus they would keep if the chunk ended now
+    # (secured terms and a complete one), never the bonus of a term still being spelled. After "ВМС" has won on its bonus, the
+    # reserved slots follow the winning path, so its plain "Ко" is not crowded out by the terms "К?Я" that never complete.
     lex, lp = chunk_after_a_fix(2.0, 'АБВ', 0.4)
     assert SP.decode_ids(g2h.beam_decode(lex, lp, 3, beam=4, reserve=0)) == 'ВМС Коты'
-    assert SP.decode_ids(g2h.beam_decode(lex, lp, 3, beam=4, reserve=2)) == 'ВМС КАты'
+    assert SP.decode_ids(g2h.beam_decode(lex, lp, 3, beam=4, reserve=2)) == 'ВМС Коты'
     lex, lp = chunk_after_a_fix(4.0, 'АБВГДЕЖЗИЛМНП', 0.35)                        # the shipped defaults: beam 16, w 3, reserve 4
-    assert SP.decode_ids(g2h.beam_decode(lex, lp, g2h.DEFAULT_W, reserve=g2h.DEFAULT_RESERVE)) == 'ВМС КАты'
+    assert SP.decode_ids(g2h.beam_decode(lex, lp, g2h.DEFAULT_W, reserve=0)) == 'ВМС Коты'
+    assert SP.decode_ids(g2h.beam_decode(lex, lp, g2h.DEFAULT_W, reserve=g2h.DEFAULT_RESERVE)) == 'ВМС Коты'
+
+
+def test_reserve_does_not_count_the_bonus_of_a_term_still_being_spelled():
+    # Three slots, and without the reserve the terms "К?Я", still being spelled, take them all. One reserved slot saves the plain
+    # "Ко" of the corrected path only under the right ranking: by the acoustic score alone it goes to a "ВМе" path, with the live
+    # bonus counted — to one more "К?Я".
+    lex, lp = chunk_after_a_fix(2.0, 'АБВ', 0.4)
+    assert SP.decode_ids(g2h.beam_decode(lex, lp, 3, beam=3, reserve=0)) == 'ВМС КАты'
+    assert SP.decode_ids(g2h.beam_decode(lex, lp, 3, beam=3, reserve=1)) == 'ВМС Коты'
 
 
 def test_ctc_align_finds_the_frames_of_every_token():
