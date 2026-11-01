@@ -4,5 +4,5 @@
 # from arriving unread. ruff is still 0.x, and a new minor brings new rules with it — let Dependabot propose the bump
 # so CI answers first.
 numpy>=2.5.3,<3
-pytest>=9.1.1,<10
-ruff>=0.16.9,<0.17
+pytest>=9.2.0,<10
+ruff>=0.17.3,<0.18
